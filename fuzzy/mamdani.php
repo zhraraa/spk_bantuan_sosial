@@ -1,7 +1,4 @@
 <?php
-// Mesin fuzzy Mamdani (bagian: pengambilan data, fuzzifikasi, evaluasi aturan, inferensi, agregasi)
-// Defuzzifikasi (centroid) dan perangkingan dikerjakan di tahap berikutnya
-// memakai keluaran fungsi prosesFuzzy() di bawah ini.
 
 require_once __DIR__ . '/membership.php';
 
@@ -155,5 +152,197 @@ function prosesFuzzy($conn, $id = null) {
     }
 
     return $hasil;
+}
+
+function normalisasiAgregasiOutput($agregasi) {
+    if (!is_array($agregasi)) {
+        throw new InvalidArgumentException('Data agregasi harus berupa array.');
+    }
+
+    $hasil = [
+        'Layak' => 0.0,
+        'Dipertimbangkan' => 0.0,
+        'Tidak Layak' => 0.0,
+    ];
+
+    foreach ($hasil as $label => $nilaiAwal) {
+        if (array_key_exists($label, $agregasi)) {
+            if (!is_numeric($agregasi[$label])) {
+                throw new InvalidArgumentException('Derajat agregasi ' . $label . ' harus berupa angka.');
+            }
+
+            $nilai = (float) $agregasi[$label];
+            if ($nilai < -0.000001 || $nilai > 1.000001) {
+                throw new InvalidArgumentException('Derajat agregasi ' . $label . ' harus berada pada rentang 0 sampai 1.');
+            }
+
+            $hasil[$label] = max(0.0, min(1.0, $nilai));
+        }
+    }
+
+    return $hasil;
+}
+
+function defuzzifikasiCentroidTitikTengah($agregasi) {
+    $agregasi = normalisasiAgregasiOutput($agregasi);
+
+    $titikTengah = [
+        'Tidak Layak' => 20.0,
+        'Dipertimbangkan' => 50.0,
+        'Layak' => 80.0,
+    ];
+
+    $jumlahBerbobot = 0.0;
+    $jumlahDerajat = 0.0;
+
+    foreach ($titikTengah as $label => $titik) {
+        $derajat = $agregasi[$label];
+        $jumlahBerbobot += $derajat * $titik;
+        $jumlahDerajat += $derajat;
+    }
+
+    if ($jumlahDerajat <= 0.0) {
+        return null;
+    }
+
+    return $jumlahBerbobot / $jumlahDerajat;
+}
+
+function keanggotaanOutputKelayakan($label, $z) {
+    $z = (float) $z;
+
+    if ($label === 'Tidak Layak') {
+        if ($z <= 30.0) {
+            return 1.0;
+        }
+        if ($z < 50.0) {
+            return (50.0 - $z) / 20.0;
+        }
+        return 0.0;
+    }
+
+    if ($label === 'Dipertimbangkan') {
+        if ($z <= 30.0 || $z >= 70.0) {
+            return 0.0;
+        }
+        if ($z <= 50.0) {
+            return ($z - 30.0) / 20.0;
+        }
+        return (70.0 - $z) / 20.0;
+    }
+
+    if ($label === 'Layak') {
+        if ($z <= 50.0) {
+            return 0.0;
+        }
+        if ($z < 70.0) {
+            return ($z - 50.0) / 20.0;
+        }
+        return 1.0;
+    }
+
+    throw new InvalidArgumentException('Label output tidak dikenal: ' . $label);
+}
+
+function defuzzifikasiCentroidKurvaMamdani($agregasi, $jumlahInterval = 10000) {
+    $agregasi = normalisasiAgregasiOutput($agregasi);
+    $jumlahInterval = (int) $jumlahInterval;
+
+    if ($jumlahInterval < 100 || $jumlahInterval > 1000000) {
+        throw new InvalidArgumentException('Jumlah interval harus berada pada rentang 100 sampai 1.000.000.');
+    }
+
+    $dx = 100.0 / $jumlahInterval;
+    $luas = 0.0;
+    $momen = 0.0;
+    $zSebelumnya = 0.0;
+
+    $muSebelumnya = max(
+        min(keanggotaanOutputKelayakan('Tidak Layak', 0.0), $agregasi['Tidak Layak']),
+        min(keanggotaanOutputKelayakan('Dipertimbangkan', 0.0), $agregasi['Dipertimbangkan']),
+        min(keanggotaanOutputKelayakan('Layak', 0.0), $agregasi['Layak'])
+    );
+
+    for ($i = 1; $i <= $jumlahInterval; $i++) {
+        $z = $i * $dx;
+
+        $muTidakLayak = min(keanggotaanOutputKelayakan('Tidak Layak', $z), $agregasi['Tidak Layak']);
+        $muDipertimbangkan = min(keanggotaanOutputKelayakan('Dipertimbangkan', $z), $agregasi['Dipertimbangkan']);
+        $muLayak = min(keanggotaanOutputKelayakan('Layak', $z), $agregasi['Layak']);
+        $mu = max($muTidakLayak, $muDipertimbangkan, $muLayak);
+
+        // Aturan trapesium untuk luas dan momen pertama.
+        $luas += (($muSebelumnya + $mu) / 2.0) * $dx;
+        $momen += ((($zSebelumnya * $muSebelumnya) + ($z * $mu)) / 2.0) * $dx;
+
+        $zSebelumnya = $z;
+        $muSebelumnya = $mu;
+    }
+
+    if ($luas <= 0.0) {
+        return null;
+    }
+
+    return $momen / $luas;
+}
+
+// Fungsi utama defuzzifikasi. //
+function defuzzifikasiCentroid($agregasi, $metode = 'titik_tengah') {
+    if ($metode === 'titik_tengah') {
+        return defuzzifikasiCentroidTitikTengah($agregasi);
+    }
+
+    if ($metode === 'kurva_mamdani') {
+        return defuzzifikasiCentroidKurvaMamdani($agregasi);
+    }
+
+    throw new InvalidArgumentException('Metode defuzzifikasi tidak dikenal. Gunakan titik_tengah atau kurva_mamdani.');
+}
+
+// Mengubah skor akhir menjadi kategori keputusan sesuai halaman 13 PDF. Z < 50: Tidak Layak; 50 <= Z < 70: Dipertimbangkan; Z >= 70: Layak.
+function tentukanKategoriPrioritas($skorAkhir) {
+    if (!is_numeric($skorAkhir)) {
+        return 'Belum Dinilai';
+    }
+
+    $skorAkhir = (float) $skorAkhir;
+
+    if ($skorAkhir < 50.0) {
+        return 'Tidak Layak';
+    }
+    if ($skorAkhir < 70.0) {
+        return 'Dipertimbangkan';
+    }
+    return 'Layak';
+}
+
+// Menambahkan skor akhir, metode, dan kategori ke satu hasil prosesFuzzyWarga(). //
+function tambahkanHasilDefuzzifikasi($hasilFuzzy, $metode = 'titik_tengah') {
+    if (!isset($hasilFuzzy['agregasi'])) {
+        throw new InvalidArgumentException('Hasil fuzzy tidak memiliki data agregasi.');
+    }
+
+    $skorAkhir = defuzzifikasiCentroid($hasilFuzzy['agregasi'], $metode);
+    $kategori = ($skorAkhir === null)
+        ? 'Belum Dinilai'
+        : tentukanKategoriPrioritas($skorAkhir);
+
+    $hasilFuzzy['skor_akhir'] = ($skorAkhir === null) ? null : round($skorAkhir, 2);
+    $hasilFuzzy['kategori'] = $kategori;
+    $hasilFuzzy['metode_defuzzifikasi'] = $metode;
+
+    return $hasilFuzzy;
+}
+
+// Proses lengkap untuk satu atau semua calon penerima: fuzzifikasi -> inferensi -> agregasi -> defuzzifikasi -> kategori //
+function prosesFuzzyDenganSkor($conn, $id = null, $metode = 'titik_tengah') {
+    $hasilFuzzy = prosesFuzzy($conn, $id);
+    $hasilLengkap = [];
+
+    foreach ($hasilFuzzy as $hasil) {
+        $hasilLengkap[] = tambahkanHasilDefuzzifikasi($hasil, $metode);
+    }
+
+    return $hasilLengkap;
 }
 ?>
